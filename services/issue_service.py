@@ -232,3 +232,29 @@ def replace_labels(db: Session, issue_id: int, label_names: List[str]):
 
     db.refresh(issue)
     return issue
+
+def bulk_status_update(db: Session, updates: List[Dict]):
+    """
+    updates = [{"issue_id": 1, "status": "DONE"}, ...]
+    Rollback entire batch if any update fails
+    """
+    try:
+        with db.begin():  # start transaction
+            for item in updates:
+                issue = db.query(Issue).filter(Issue.id == item["issue_id"]).first()
+                if not issue:
+                    raise ValueError(f"Issue {item['issue_id']} not found")
+
+                # Example rule: can't reopen DONE issue
+                if issue.status == IssueStatus.DONE and item["status"] != IssueStatus.DONE:
+                    raise ValueError(f"Cannot reopen issue {issue.id}")
+
+                issue.status = item["status"]
+                if item["status"] == IssueStatus.DONE:
+                    issue.resolved_at = datetime.utcnow()
+                issue.version += 1  # increment version
+    except Exception as e:
+        db.rollback()  # rollback entire transaction
+        raise e
+
+    return True
