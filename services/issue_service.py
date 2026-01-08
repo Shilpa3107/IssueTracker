@@ -258,3 +258,35 @@ def bulk_status_update(db: Session, updates: List[Dict]):
         raise e
 
     return True
+
+def import_issues_csv(db: Session, file_contents: str):
+    from io import StringIO
+    import csv
+
+    reader = csv.DictReader(StringIO(file_contents))
+    success = 0
+    failed = 0
+    errors = []
+
+    try:
+        with db.begin():  # start transaction
+            for row in reader:
+                try:
+                    assignee_id = None
+                    if row.get("assignee_email"):
+                        user = db.query(User).filter(User.email == row["assignee_email"]).first()
+                        if not user:
+                            raise ValueError(f"Assignee {row['assignee_email']} not found")
+                        assignee_id = user.id
+
+                    create_issue(db, row["title"], row.get("description"), assignee_id)
+                    success += 1
+                except Exception as e:
+                    failed += 1
+                    errors.append(str(e))
+                    # continue to next row; transaction still safe
+    except Exception as e:
+        db.rollback()
+        raise e
+
+    return {"success": success, "failed": failed, "errors": errors}
