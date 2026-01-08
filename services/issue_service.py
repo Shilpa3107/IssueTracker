@@ -183,3 +183,26 @@ def average_resolution_time(db: Session):
         .scalar()
     )
     return result or 0
+
+def update_issue(db: Session, issue_id: int, data: dict):
+    issue = db.query(Issue).filter(Issue.id == issue_id).with_for_update().first()  # lock row
+    if not issue:
+        raise ValueError("Issue not found")
+
+    # Check version for optimistic concurrency
+    if data.get("version") != issue.version:
+        raise ValueError("Version conflict")
+
+    # Apply updates
+    for key in ["title", "description", "status", "assignee_id"]:
+        if key in data and data[key] is not None:
+            setattr(issue, key, data[key])
+
+    if data.get("status") == IssueStatus.DONE:
+        issue.resolved_at = datetime.utcnow()
+
+    issue.version += 1  # increment version
+
+    db.commit()
+    db.refresh(issue)
+    return issue
