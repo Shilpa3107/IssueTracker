@@ -206,3 +206,29 @@ def update_issue(db: Session, issue_id: int, data: dict):
     db.commit()
     db.refresh(issue)
     return issue
+
+def replace_labels(db: Session, issue_id: int, label_names: List[str]):
+    issue = db.query(Issue).filter(Issue.id == issue_id).first()
+    if not issue:
+        raise ValueError("Issue not found")
+
+    # Start a transaction for atomicity
+    try:
+        with db.begin():  # transaction starts here
+            # Remove existing labels
+            db.execute(issue_labels.delete().where(issue_labels.c.issue_id == issue_id))
+
+            # Add new labels
+            for name in label_names:
+                label = db.query(Label).filter(Label.name == name).first()
+                if not label:
+                    label = Label(name=name)
+                    db.add(label)
+                    db.flush()  # get ID without commit
+                db.execute(issue_labels.insert().values(issue_id=issue_id, label_id=label.id))
+    except Exception as e:
+        db.rollback()
+        raise e
+
+    db.refresh(issue)
+    return issue
