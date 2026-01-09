@@ -1,12 +1,17 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
+
 from database import get_db
+from models.issue import Issue, IssueStatus
 from schemas.issue import IssueCreate, IssueUpdate, IssueRead
-from schemas.label import LabelCreate
 from services.issue_service import (
-    create_issue, update_issue, replace_labels,
-    bulk_status_update, import_issues_csv
+    create_issue,
+    update_issue,
+    replace_labels,
+    bulk_status_update,
+    import_issues_csv,
+    get_issue_timeline
 )
 
 router = APIRouter(prefix="/issues", tags=["Issues"])
@@ -19,16 +24,27 @@ def api_create_issue(issue: IssueCreate, db: Session = Depends(get_db)):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# LIST ISSUES with optional pagination
+# LIST ISSUES (Filter + Pagination)
 @router.get("/", response_model=List[IssueRead])
-def api_list_issues(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
-    issues = db.query(IssueRead).offset(skip).limit(limit).all()
-    return issues
+def api_list_issues(
+    status: Optional[IssueStatus] = None,
+    assignee_id: Optional[int] = None,
+    skip: int = 0, 
+    limit: int = 10, 
+    db: Session = Depends(get_db)
+):
+    query = db.query(Issue)
+    if status:
+        query = query.filter(Issue.status == status)
+    if assignee_id:
+        query = query.filter(Issue.assignee_id == assignee_id)
+    
+    return query.offset(skip).limit(limit).all()
 
-# GET ISSUE by ID
+# GET ISSUE
 @router.get("/{issue_id}", response_model=IssueRead)
 def api_get_issue(issue_id: int, db: Session = Depends(get_db)):
-    issue = db.query(IssueRead).filter(IssueRead.id == issue_id).first()
+    issue = db.query(Issue).filter(Issue.id == issue_id).first()
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
     return issue
@@ -64,5 +80,12 @@ def api_bulk_status_update(updates: List[dict], db: Session = Depends(get_db)):
 @router.post("/import")
 def api_import_issues(file: UploadFile = File(...), db: Session = Depends(get_db)):
     content = file.file.read().decode("utf-8")
-    summary = import_issues_csv(db, content)
-    return summary
+    return import_issues_csv(db, content)
+
+# BONUS: TIMELINE
+@router.get("/{issue_id}/timeline")
+def api_get_timeline(issue_id: int, db: Session = Depends(get_db)):
+    timeline = get_issue_timeline(db, issue_id)
+    if not timeline and not db.query(Issue).filter(Issue.id == issue_id).first():
+         raise HTTPException(status_code=404, detail="Issue not found")
+    return [{"action": t.action, "timestamp": t.timestamp} for t in timeline]

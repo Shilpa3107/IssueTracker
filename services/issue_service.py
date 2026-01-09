@@ -1,13 +1,14 @@
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from models.issue import Issue, IssueStatus
+from models.issue import Issue, IssueStatus, IssueHistory
 from models.user import User
 from models.label import Label, issue_labels
 from models.comment import Comment
-from typing import List, Dict
+from typing import List, Dict, Optional
 from datetime import datetime
 import csv
 from io import StringIO
+from sqlalchemy import func
 
 # -----------------------------
 # ISSUE CRUD & VERSION CONTROL
@@ -22,29 +23,40 @@ def create_issue(db: Session, title: str, description: str = None, assignee_id: 
     
     issue = Issue(title=title, description=description, assignee_id=assignee_id)
     db.add(issue)
+    db.flush() # get ID
+    
+    history = IssueHistory(issue_id=issue.id, action="Issue created")
+    db.add(history)
+    
     db.commit()
     db.refresh(issue)
     return issue
 
 def update_issue(db: Session, issue_id: int, data: dict):
-    # data must include version
-    issue = db.query(Issue).filter(Issue.id == issue_id).first()
+    issue = db.query(Issue).filter(Issue.id == issue_id).with_for_update().first()
     if not issue:
         raise ValueError("Issue not found")
 
-    if data.get("version") != issue.version:
+    if "version" in data and data["version"] != issue.version:
         raise ValueError("Version conflict")
 
-    # Update fields
+    old_status = issue.status
     for key in ["title", "description", "status", "assignee_id"]:
         if key in data and data[key] is not None:
-            setattr(issue, key, data[key])
-    
-    # Update resolved_at if status DONE
+            val = data[key]
+            if key == "status":
+                val = IssueStatus.from_str(val)
+            setattr(issue, key, val)
+
+
+    if issue.status != old_status:
+        history = IssueHistory(issue_id=issue.id, action=f"Status changed from {old_status} to {issue.status}")
+        db.add(history)
+
     if data.get("status") == IssueStatus.DONE:
         issue.resolved_at = datetime.utcnow()
-    
-    issue.version += 1  # increment version
+
+    issue.version += 1
     db.commit()
     db.refresh(issue)
     return issue
@@ -72,25 +84,22 @@ def add_comment(db: Session, issue_id: int, author_id: int, body: str):
 # -----------------------------
 
 def replace_labels(db: Session, issue_id: int, label_names: List[str]):
-    from models.issue import issue_labels  # association table
-
     issue = db.query(Issue).filter(Issue.id == issue_id).first()
     if not issue:
         raise ValueError("Issue not found")
 
-    # Start transaction
     try:
-        # Delete existing labels
         db.execute(issue_labels.delete().where(issue_labels.c.issue_id == issue_id))
-        
-        # Add new labels
         for name in label_names:
             label = db.query(Label).filter(Label.name == name).first()
             if not label:
                 label = Label(name=name)
                 db.add(label)
-                db.flush()  # get id without commit
+                db.flush()
             db.execute(issue_labels.insert().values(issue_id=issue_id, label_id=label.id))
+        
+        history = IssueHistory(issue_id=issue_id, action="Labels updated")
+        db.add(history)
         db.commit()
     except Exception as e:
         db.rollback()
@@ -103,23 +112,26 @@ def replace_labels(db: Session, issue_id: int, label_names: List[str]):
 # -----------------------------
 
 def bulk_status_update(db: Session, updates: List[Dict]):
-    """
-    updates = [{"issue_id": 1, "status": "DONE"}, ...]
-    Rollback if any update fails
-    """
     try:
         for item in updates:
-            issue = db.query(Issue).filter(Issue.id == item["issue_id"]).first()
+            issue = db.query(Issue).filter(Issue.id == item["issue_id"]).with_for_update().first()
             if not issue:
                 raise ValueError(f"Issue {item['issue_id']} not found")
-            # Example rule: can't reopen a DONE issue
+            
             if issue.status == IssueStatus.DONE and item["status"] != IssueStatus.DONE:
                 raise ValueError(f"Cannot reopen issue {issue.id}")
-            issue.status = item["status"]
-            if item["status"] == IssueStatus.DONE:
+            
+            old_status = issue.status
+            new_status = IssueStatus.from_str(item["status"])
+            issue.status = new_status
+            if new_status == IssueStatus.DONE:
                 issue.resolved_at = datetime.utcnow()
             issue.version += 1
+            
+            history = IssueHistory(issue_id=issue.id, action=f"Bulk status update: {old_status} -> {issue.status}")
+            db.add(history)
         db.commit()
+
     except Exception as e:
         db.rollback()
         raise e
@@ -130,10 +142,6 @@ def bulk_status_update(db: Session, updates: List[Dict]):
 # -----------------------------
 
 def import_issues_csv(db: Session, file_contents: str):
-    """
-    file_contents: CSV string with headers: title,description,assignee_email
-    Returns summary: {"success": int, "failed": int, "errors": [list]}
-    """
     reader = csv.DictReader(StringIO(file_contents))
     success = 0
     failed = 0
@@ -143,15 +151,17 @@ def import_issues_csv(db: Session, file_contents: str):
         try:
             assignee_id = None
             if row.get("assignee_email"):
-                user = db.query(User).filter(User.email == row["assignee_email"]).first()
+                user = db.query(User).filter(User.email == row["assignee_email"].strip()).first()
                 if not user:
                     raise ValueError(f"Assignee {row['assignee_email']} not found")
                 assignee_id = user.id
-            create_issue(db, title=row["title"], description=row.get("description"), assignee_id=assignee_id)
+            
+            create_issue(db, row["title"], row.get("description"), assignee_id)
             success += 1
         except Exception as e:
             failed += 1
-            errors.append(str(e))
+            errors.append(f"Row {success + failed}: {str(e)}")
+    
     return {"success": success, "failed": failed, "errors": errors}
 
 # -----------------------------
@@ -159,24 +169,16 @@ def import_issues_csv(db: Session, file_contents: str):
 # -----------------------------
 
 def top_assignees(db: Session, limit: int = 5):
-    """
-    Returns top assignees by number of issues assigned
-    """
-    from sqlalchemy import func
     return (
         db.query(User.name, func.count(Issue.id).label("issue_count"))
         .join(Issue, Issue.assignee_id == User.id)
-        .group_by(User.id)
+        .group_by(User.id, User.name)
         .order_by(func.count(Issue.id).desc())
         .limit(limit)
         .all()
     )
 
 def average_resolution_time(db: Session):
-    """
-    Returns average time in hours for resolved issues
-    """
-    from sqlalchemy import func
     result = (
         db.query(func.avg(func.extract('epoch', Issue.resolved_at - Issue.created_at)/3600))
         .filter(Issue.resolved_at.isnot(None))
@@ -184,109 +186,9 @@ def average_resolution_time(db: Session):
     )
     return result or 0
 
-def update_issue(db: Session, issue_id: int, data: dict):
-    issue = db.query(Issue).filter(Issue.id == issue_id).with_for_update().first()  # lock row
-    if not issue:
-        raise ValueError("Issue not found")
+# -----------------------------
+# TIMELINE
+# -----------------------------
 
-    # Check version for optimistic concurrency
-    if data.get("version") != issue.version:
-        raise ValueError("Version conflict")
-
-    # Apply updates
-    for key in ["title", "description", "status", "assignee_id"]:
-        if key in data and data[key] is not None:
-            setattr(issue, key, data[key])
-
-    if data.get("status") == IssueStatus.DONE:
-        issue.resolved_at = datetime.utcnow()
-
-    issue.version += 1  # increment version
-
-    db.commit()
-    db.refresh(issue)
-    return issue
-
-def replace_labels(db: Session, issue_id: int, label_names: List[str]):
-    issue = db.query(Issue).filter(Issue.id == issue_id).first()
-    if not issue:
-        raise ValueError("Issue not found")
-
-    # Start a transaction for atomicity
-    try:
-        with db.begin():  # transaction starts here
-            # Remove existing labels
-            db.execute(issue_labels.delete().where(issue_labels.c.issue_id == issue_id))
-
-            # Add new labels
-            for name in label_names:
-                label = db.query(Label).filter(Label.name == name).first()
-                if not label:
-                    label = Label(name=name)
-                    db.add(label)
-                    db.flush()  # get ID without commit
-                db.execute(issue_labels.insert().values(issue_id=issue_id, label_id=label.id))
-    except Exception as e:
-        db.rollback()
-        raise e
-
-    db.refresh(issue)
-    return issue
-
-def bulk_status_update(db: Session, updates: List[Dict]):
-    """
-    updates = [{"issue_id": 1, "status": "DONE"}, ...]
-    Rollback entire batch if any update fails
-    """
-    try:
-        with db.begin():  # start transaction
-            for item in updates:
-                issue = db.query(Issue).filter(Issue.id == item["issue_id"]).first()
-                if not issue:
-                    raise ValueError(f"Issue {item['issue_id']} not found")
-
-                # Example rule: can't reopen DONE issue
-                if issue.status == IssueStatus.DONE and item["status"] != IssueStatus.DONE:
-                    raise ValueError(f"Cannot reopen issue {issue.id}")
-
-                issue.status = item["status"]
-                if item["status"] == IssueStatus.DONE:
-                    issue.resolved_at = datetime.utcnow()
-                issue.version += 1  # increment version
-    except Exception as e:
-        db.rollback()  # rollback entire transaction
-        raise e
-
-    return True
-
-def import_issues_csv(db: Session, file_contents: str):
-    from io import StringIO
-    import csv
-
-    reader = csv.DictReader(StringIO(file_contents))
-    success = 0
-    failed = 0
-    errors = []
-
-    try:
-        with db.begin():  # start transaction
-            for row in reader:
-                try:
-                    assignee_id = None
-                    if row.get("assignee_email"):
-                        user = db.query(User).filter(User.email == row["assignee_email"]).first()
-                        if not user:
-                            raise ValueError(f"Assignee {row['assignee_email']} not found")
-                        assignee_id = user.id
-
-                    create_issue(db, row["title"], row.get("description"), assignee_id)
-                    success += 1
-                except Exception as e:
-                    failed += 1
-                    errors.append(str(e))
-                    # continue to next row; transaction still safe
-    except Exception as e:
-        db.rollback()
-        raise e
-
-    return {"success": success, "failed": failed, "errors": errors}
+def get_issue_timeline(db: Session, issue_id: int):
+    return db.query(IssueHistory).filter(IssueHistory.issue_id == issue_id).order_by(IssueHistory.timestamp.asc()).all()

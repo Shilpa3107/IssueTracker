@@ -1,5 +1,4 @@
-import io
-import csv
+import pytest
 
 # ----------------------
 # ISSUE CREATION
@@ -31,8 +30,9 @@ def test_add_comment(client):
     res = client.post("/issues/", json={"title": "Comment Issue"})
     issue_id = res.json()["id"]
 
-    # Create a user
+    # Create a user (using the new endpoint)
     res_user = client.post("/users/", json={"name": "Tester", "email": "tester@example.com"})
+    assert res_user.status_code == 201
     user_id = res_user.json()["id"]
 
     # Add comment
@@ -57,12 +57,67 @@ def test_replace_labels(client):
     assert "urgent" in labels
 
 # ----------------------
+# BULK UPDATE
+# ----------------------
+def test_bulk_status_update(client):
+    # Create two issues
+    i1 = client.post("/issues/", json={"title": "Issue 1"}).json()["id"]
+    i2 = client.post("/issues/", json={"title": "Issue 2"}).json()["id"]
+
+    # Bulk update
+    updates = [
+        {"issue_id": i1, "status": "IN_PROGRESS"},
+        {"issue_id": i2, "status": "DONE"}
+    ]
+    res = client.post("/issues/bulk-status", json=updates)
+    assert res.status_code == 200
+    
+    # Verify
+    assert client.get(f"/issues/{i1}").json()["status"] == "IN_PROGRESS"
+    assert client.get(f"/issues/{i2}").json()["status"] == "DONE"
+
+# ----------------------
 # CSV IMPORT
 # ----------------------
 def test_csv_import(client):
-    csv_content = "title,description,assignee_email\nCSV Issue,Desc,\n"
-    file = {"file": ("issues.csv", csv_content, "text/csv")}
-    res = client.post("/issues/import", files=file)
+    csv_content = "title,description,assignee_email\nCSV Issue 1,Desc 1,\nCSV Issue 2,Desc 2,\n"
+    files = {"file": ("issues.csv", csv_content, "text/csv")}
+    res = client.post("/issues/import", files=files)
     assert res.status_code == 200
     data = res.json()
-    assert data["success"] == 1
+    assert data["success"] == 2
+
+# ----------------------
+# BONUS: TIMELINE
+# ----------------------
+def test_timeline(client):
+    # Create issue
+    res = client.post("/issues/", json={"title": "Timeline Issue"})
+    issue_id = res.json()["id"]
+
+    # Update status
+    client.patch(f"/issues/{issue_id}", json={"status": "DONE", "version": 1})
+
+    # Get timeline
+    res_timeline = client.get(f"/issues/{issue_id}/timeline")
+    assert res_timeline.status_code == 200
+    events = res_timeline.json()
+    assert len(events) >= 2
+    assert "Issue created" in events[0]["action"]
+    assert "Status changed" in events[1]["action"]
+
+# ----------------------
+# FILTERING
+# ----------------------
+def test_filtering(client):
+    # Create issues with different statuses
+    client.post("/issues/", json={"title": "Open Issue"})
+    i2 = client.post("/issues/", json={"title": "Done Issue"})
+    client.patch(f"/issues/{i2.json()['id']}", json={"status": "DONE", "version": 1})
+
+    # Filter for DONE
+    res = client.get("/issues/?status=DONE")
+    assert res.status_code == 200
+    issues = res.json()
+    assert all(i["status"] == "DONE" for i in issues)
+    assert len(issues) >= 1
